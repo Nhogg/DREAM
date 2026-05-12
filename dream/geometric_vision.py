@@ -1,3 +1,5 @@
+# Most important; examine pnp method further
+
 # Copyright (c) 2020 NVIDIA Corporation. All rights reserved.
 # This work is licensed under the NVIDIA Source Code License - Non-commercial. Full
 # text can be found in LICENSE.md
@@ -48,17 +50,16 @@ def solve_pnp(
 
     n_canonial_points = len(canonical_points)
     n_projections = len(projections)
-    assert (
-        n_canonial_points == n_projections
-    ), "Expected canonical_points and projections to have the same length, but they are length {} and {}.".format(
-        n_canonial_points, n_projections
+    assert n_canonial_points == n_projections, (
+        "Expected canonical_points and projections to have the same length, but they are length {} and {}.".format(
+            n_canonial_points, n_projections
+        )
     )
 
     # Process points to remove any NaNs
     canonical_points_proc = []
     projections_proc = []
     for canon_pt, proj in zip(canonical_points, projections):
-
         if (
             canon_pt is None
             or len(canon_pt) == 0
@@ -124,17 +125,16 @@ def solve_pnp_ransac(
 
     n_canonial_points = len(canonical_points)
     n_projections = len(projections)
-    assert (
-        n_canonial_points == n_projections
-    ), "Expected canonical_points and projections to have the same length, but they are length {} and {}.".format(
-        n_canonial_points, n_projections
+    assert n_canonial_points == n_projections, (
+        "Expected canonical_points and projections to have the same length, but they are length {} and {}.".format(
+            n_canonial_points, n_projections
+        )
     )
 
     # Process points to remove any NaNs
     canonical_points_proc = []
     projections_proc = []
     for canon_pt, proj in zip(canonical_points, projections):
-
         if (
             canon_pt is None
             or len(canon_pt) == 0

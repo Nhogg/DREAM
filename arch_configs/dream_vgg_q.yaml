@@ -1,3 +1,5 @@
+# Architecture configs
+# Model outputs belief maps (per keypoint heatmaps)
 !!omap
 - architecture: !!omap
   - type: vgg

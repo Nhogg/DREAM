@@ -1,3 +1,4 @@
+# defined keypoints
 !!omap
 - manipulator: !!omap
   - name: panda

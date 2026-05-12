@@ -24,6 +24,247 @@ import dream
 # os.environ["CUDA_VISIBLE_DEVICES"]="0,1,2,3"
 
 
+def _to_plain_python(value):
+    if isinstance(value, odict) or isinstance(value, dict):
+        return {k: _to_plain_python(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_plain_python(v) for v in value]
+    if isinstance(value, tuple):
+        return [_to_plain_python(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _initialize_wandb(args, network_config, n_data, n_train_data, n_valid_data):
+    if not args.wandb:
+        return None
+
+    try:
+        import wandb
+    except ImportError:
+        raise ImportError(
+            "W&B logging was requested, but wandb is not installed. "
+            "Install dependencies from requirements.txt or run `pip install wandb`."
+        )
+
+    wandb_config = _to_plain_python(network_config)
+    wandb_config["dataset"] = {
+        "num_samples": n_data,
+        "num_train_samples": n_train_data,
+        "num_validation_samples": n_valid_data,
+    }
+    wandb_config["script_args"] = {
+        "input_data_path": args.input_data_path,
+        "output_dir": args.output_dir,
+        "architecture_config": args.architecture_config,
+        "manipulator_config_path": args.manipulator_config_path,
+        "resume_training": args.resume_training,
+        "random_seed": args.random_seed,
+        "wandb_visualize_every": args.wandb_visualize_every,
+        "wandb_num_visualizations": args.wandb_num_visualizations,
+    }
+
+    wandb_run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        tags=args.wandb_tags,
+        mode=args.wandb_mode,
+        config=wandb_config,
+    )
+    wandb.define_metric("epoch")
+    wandb.define_metric("train/*", step_metric="epoch")
+    wandb.define_metric("valid/*", step_metric="epoch")
+    wandb.define_metric("time/*", step_metric="epoch")
+    wandb.define_metric("best/*", step_metric="epoch")
+    return wandb_run
+
+
+def _log_wandb_epoch(
+    wandb_run,
+    this_epoch,
+    mean_training_loss_per_batch,
+    std_training_loss_per_batch,
+    mean_valid_loss_per_batch,
+    std_valid_loss_per_batch,
+    training_batch_losses,
+    valid_batch_losses,
+    this_epoch_timestamp,
+    epoch_duration,
+    best_valid_loss,
+):
+    if wandb_run is None:
+        return
+
+    import wandb
+
+    wandb_run.log(
+        {
+            "epoch": this_epoch,
+            "train/loss_mean": float(mean_training_loss_per_batch),
+            "train/loss_stdev": float(std_training_loss_per_batch),
+            "train/loss_batch": wandb.Histogram(training_batch_losses),
+            "valid/loss_mean": float(mean_valid_loss_per_batch),
+            "valid/loss_stdev": float(std_valid_loss_per_batch),
+            "valid/loss_batch": wandb.Histogram(valid_batch_losses),
+            "best/valid_loss_mean": float(best_valid_loss),
+            "time/epoch_seconds": float(epoch_duration),
+            "time/elapsed_seconds": float(this_epoch_timestamp),
+        },
+        step=this_epoch,
+    )
+
+
+def _log_wandb_visualizations(
+    wandb_run,
+    dream_network,
+    sample,
+    this_epoch,
+    num_visualizations,
+):
+    if wandb_run is None or num_visualizations <= 0:
+        return
+
+    import wandb
+
+    max_images = min(num_visualizations, sample["image_rgb_input"].shape[0])
+    network_input = sample["image_rgb_input"][:max_images].cuda()
+
+    with torch.no_grad():
+        belief_maps_batch, detected_kp_projs_netout_batch = dream_network.inference(
+            network_input
+        )
+
+    net_input_resolution = dream_network.trained_net_input_resolution()
+    net_output_resolution = dream_network.trained_net_output_resolution()
+
+    images = []
+    for idx in range(max_images):
+        image = dream.image_proc.image_from_tensor(sample["image_rgb_input_viz"][idx])
+        detected_kp_projs_netout = np.array(
+            detected_kp_projs_netout_batch[idx], dtype=float
+        )
+        detected_kp_projs_netin = dream.image_proc.convert_keypoints_to_netin_from_netout(
+            detected_kp_projs_netout,
+            net_output_resolution,
+            net_input_resolution,
+        )
+        gt_kp_projs_netout = np.array(
+            sample["keypoint_projections_output"][idx], dtype=float
+        )
+        gt_kp_projs_netin = dream.image_proc.convert_keypoints_to_netin_from_netout(
+            gt_kp_projs_netout,
+            net_output_resolution,
+            net_input_resolution,
+        )
+
+        flattened_belief_tensor = belief_maps_batch[idx].detach().sum(dim=0)
+        belief_image = dream.image_proc.image_from_belief_map(
+            flattened_belief_tensor, colormap="hot", normalization_method=6
+        )
+        belief_image = dream.image_proc.convert_image_to_netin_from_netout(
+            belief_image, net_input_resolution
+        )
+        overlay = dream.image_proc.PILImage.blend(image, belief_image, alpha=0.45)
+        overlay = dream.image_proc.overlay_points_on_image(
+            overlay,
+            gt_kp_projs_netin,
+            point_diameter=10.0,
+            annotation_color_dot="lime",
+            annotation_color_text="lime",
+        )
+        overlay = dream.image_proc.overlay_points_on_image(
+            overlay,
+            detected_kp_projs_netin,
+            dream_network.friendly_keypoint_names,
+            point_diameter=6.0,
+            annotation_color_dot="red",
+            annotation_color_text="red",
+        )
+
+        sample_name = sample["config"]["name"][idx]
+        caption = "{} | green=ground truth, red=prediction".format(sample_name)
+        images.append(wandb.Image(overlay, caption=caption))
+
+    wandb_run.log({"valid/visualizations": images}, step=this_epoch)
+
+
+def _training_labels_from_sample(dream_network, sample):
+    if dream_network.network_config["architecture"]["target"] == "belief_maps":
+        return sample["belief_maps"].cuda()
+    if dream_network.network_config["architecture"]["target"] == "keypoints":
+        return sample["keypoint_projections_output"].cuda()
+    assert False, "Could not determine how to provide training labels to network."
+
+
+def _validation_loss_for_sample(dream_network, sample):
+    valid_network_input_heads = [sample["image_rgb_input"].cuda()]
+    valid_labels = _training_labels_from_sample(dream_network, sample)
+    valid_loss = dream_network.loss(valid_network_input_heads, valid_labels)
+    return valid_loss.item()
+
+
+def _run_validation(
+    args,
+    dream_network,
+    valid_data_loader,
+    log_wandb_visualizations,
+):
+    dream_network.enable_evaluation()
+
+    with torch.no_grad():
+
+        valid_batch_losses = []
+        valid_batch_sample_names = []
+        wandb_visualization_sample = None
+
+        for valid_batch_idx, valid_sample in enumerate(tqdm(valid_data_loader)):
+
+            if log_wandb_visualizations and wandb_visualization_sample is None:
+                wandb_visualization_sample = valid_sample
+
+            this_valid_batch_sample_names = valid_sample["config"]["name"]
+            this_valid_batch_size = valid_sample["image_rgb_input"].shape[0]
+
+            if args.verbose:
+                print(
+                    "Processing batch index {} for validation...".format(
+                        valid_batch_idx
+                    )
+                )
+                print(
+                    "Sample names in this validation batch: {}".format(
+                        this_valid_batch_sample_names
+                    )
+                )
+                print("This validation batch size: {}".format(this_valid_batch_size))
+
+            valid_loss_this_batch = _validation_loss_for_sample(
+                dream_network, valid_sample
+            )
+            valid_batch_losses.append(valid_loss_this_batch)
+            if args.verbose:
+                print(
+                    "Validation loss for this batch: {}".format(
+                        valid_loss_this_batch
+                    )
+                )
+                print("")
+            valid_batch_sample_names.append(this_valid_batch_sample_names)
+
+        mean_valid_loss_per_batch = np.mean(valid_batch_losses)
+        std_valid_loss_per_batch = np.std(valid_batch_losses)
+
+    return (
+        mean_valid_loss_per_batch,
+        std_valid_loss_per_batch,
+        valid_batch_losses,
+        valid_batch_sample_names,
+        wandb_visualization_sample,
+    )
+
+
 def train_network(args):
 
     # Input argument handling
@@ -419,7 +660,10 @@ def train_network(args):
     ] = trained_net_output_res
 
     # Create NDDS dataset and loader
-    training_debug_mode = dream.datasets.ManipulatorNDDSDatasetDebugLevels["NONE"]
+    log_wandb_visualizations = args.wandb and args.wandb_visualize_every > 0
+    training_debug_mode = dream.datasets.ManipulatorNDDSDatasetDebugLevels[
+        "LIGHT" if log_wandb_visualizations else "NONE"
+    ]
     network_requires_belief_maps = (
         dream_network.network_config["architecture"]["target"] == "belief_maps"
     )
@@ -453,6 +697,10 @@ def train_network(args):
         valid_dataset, batch_size=args.batch_size, num_workers=args.num_workers
     )
 
+    wandb_run = _initialize_wandb(
+        args, network_config, n_data, n_train_data, n_valid_data
+    )
+
     # Train the network
     print("")
     print("TRAINING NETWORK ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
@@ -460,6 +708,212 @@ def train_network(args):
     print("")
 
     last_epoch_timestamp = 0.0
+    last_step_timestamp = 0.0
+    global_step = 0
+    epoch_training_log_path = None
+
+    if args.max_steps is not None:
+        assert (
+            args.max_steps > 0
+        ), "If specified, max_steps must be greater than 0."
+        assert (
+            args.log_every_steps > 0
+        ), "log_every_steps must be greater than 0."
+
+        print(
+            "Step-based training enabled: {} optimizer steps, logging every {} steps.".format(
+                args.max_steps, args.log_every_steps
+            )
+        )
+
+        step_train_losses = []
+        step_train_sample_names = []
+        train_iterator = iter(train_data_loader)
+        dream_network.enable_training()
+
+        with tqdm(total=args.max_steps) as step_progress:
+            while global_step < args.max_steps:
+                try:
+                    sample = next(train_iterator)
+                except StopIteration:
+                    train_iterator = iter(train_data_loader)
+                    sample = next(train_iterator)
+
+                global_step += 1
+                this_batch_sample_names = sample["config"]["name"]
+
+                if args.verbose:
+                    print("Processing training step {}...".format(global_step))
+                    print(
+                        "Sample names in this training batch: {}".format(
+                            this_batch_sample_names
+                        )
+                    )
+
+                network_input_heads = [sample["image_rgb_input"].cuda()]
+                training_labels = _training_labels_from_sample(dream_network, sample)
+                loss = dream_network.train(network_input_heads, training_labels)
+
+                training_loss_this_batch = loss.item()
+                step_train_losses.append(training_loss_this_batch)
+                step_train_sample_names.append(this_batch_sample_names)
+                step_progress.update(1)
+
+                if (
+                    global_step % args.log_every_steps != 0
+                    and global_step != args.max_steps
+                ):
+                    continue
+
+                if args.verbose:
+                    print("")
+                    print("~~ Validation Phase ~~")
+
+                (
+                    mean_valid_loss_per_batch,
+                    std_valid_loss_per_batch,
+                    valid_batch_losses,
+                    valid_batch_sample_names,
+                    wandb_visualization_sample,
+                ) = _run_validation(
+                    args,
+                    dream_network,
+                    valid_data_loader,
+                    log_wandb_visualizations,
+                )
+                dream_network.enable_training()
+
+                mean_training_loss_per_batch = np.mean(step_train_losses)
+                std_training_loss_per_batch = np.std(step_train_losses)
+
+                dream_network.network_config["training"]["results"][
+                    "steps_trained"
+                ] = global_step
+                dream_network.network_config["training"]["results"][
+                    "training_loss"
+                ] = odict(
+                    [
+                        ("mean", float(mean_training_loss_per_batch)),
+                        ("stdev", float(std_training_loss_per_batch)),
+                    ]
+                )
+                dream_network.network_config["training"]["results"][
+                    "validation_loss"
+                ] = odict(
+                    [
+                        ("mean", float(mean_valid_loss_per_batch)),
+                        ("stdev", float(std_valid_loss_per_batch)),
+                    ]
+                )
+
+                print(
+                    "Step {} Training Loss (recent batch-wise mean +- 1 stdev): {} +- {}".format(
+                        global_step,
+                        mean_training_loss_per_batch,
+                        std_training_loss_per_batch,
+                    )
+                )
+                print(
+                    "Step {} Validation Loss (batch-wise mean +- 1 stdev): {} +- {}".format(
+                        global_step, mean_valid_loss_per_batch, std_valid_loss_per_batch
+                    )
+                )
+
+                if mean_valid_loss_per_batch < best_valid_loss:
+                    print("Best network result so far.")
+                    best_valid_loss = mean_valid_loss_per_batch
+
+                    if save_results:
+                        dream_network.save_network(
+                            args.output_dir, "best_network", overwrite=True
+                        )
+
+                this_step_timestamp = time.time() - training_start_time
+                step_duration = this_step_timestamp - last_step_timestamp
+                last_step_timestamp = this_step_timestamp
+                print(
+                    "Last {} training steps plus validation took {} seconds.".format(
+                        len(step_train_losses), step_duration
+                    )
+                )
+                print("")
+
+                _log_wandb_epoch(
+                    wandb_run,
+                    global_step,
+                    mean_training_loss_per_batch,
+                    std_training_loss_per_batch,
+                    mean_valid_loss_per_batch,
+                    std_valid_loss_per_batch,
+                    step_train_losses,
+                    valid_batch_losses,
+                    this_step_timestamp,
+                    step_duration,
+                    best_valid_loss,
+                )
+
+                if log_wandb_visualizations and wandb_visualization_sample is not None:
+                    _log_wandb_visualizations(
+                        wandb_run,
+                        dream_network,
+                        wandb_visualization_sample,
+                        global_step,
+                        args.wandb_num_visualizations,
+                    )
+
+                train_log["epochs"].append(global_step)
+                train_log["losses"].append(mean_training_loss_per_batch)
+                train_log["validation_losses"].append(mean_valid_loss_per_batch)
+                train_log["batch_training_losses"].append(step_train_losses)
+                train_log["batch_validation_losses"].append(valid_batch_losses)
+                train_log["batch_training_sample_names"].append(
+                    step_train_sample_names
+                )
+                train_log["batch_validation_sample_names"].append(
+                    valid_batch_sample_names
+                )
+                train_log["timestamps"].append(this_step_timestamp)
+
+                if "steps" not in train_log:
+                    train_log["steps"] = []
+                train_log["steps"].append(global_step)
+
+                if save_results:
+                    step_training_log_path = os.path.join(
+                        args.output_dir, "training_log_s{}.pkl".format(global_step)
+                    )
+                    with open(step_training_log_path, "wb") as f:
+                        pickle.dump(train_log, f)
+
+                    if epoch_training_log_path and os.path.exists(
+                        epoch_training_log_path
+                    ):
+                        os.remove(epoch_training_log_path)
+                    epoch_training_log_path = step_training_log_path
+
+                    dream_network.save_network(
+                        args.output_dir,
+                        "step_{}".format(global_step),
+                        overwrite=True,
+                    )
+
+                step_train_losses = []
+                step_train_sample_names = []
+
+        if save_results and epoch_training_log_path:
+            training_log_path = os.path.join(args.output_dir, "training_log.pkl")
+            os.rename(epoch_training_log_path, training_log_path)
+
+        if wandb_run is not None:
+            wandb_run.finish()
+
+        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        print("")
+        print("Done.")
+        print("")
+        print("Total training time: {} seconds.".format(time.time() - training_start_time))
+        print("")
+        return
 
     for e in tqdm(range(start_epoch, args.epochs)):
         this_epoch = e + 1
@@ -521,67 +975,18 @@ def train_network(args):
             print("")
             print("~~ Validation Phase ~~")
 
-        dream_network.enable_evaluation()
-
-        with torch.no_grad():
-
-            valid_batch_losses = []
-            valid_batch_sample_names = []
-
-            for valid_batch_idx, valid_sample in enumerate(tqdm(valid_data_loader)):
-
-                this_valid_batch_sample_names = valid_sample["config"]["name"]
-                this_valid_batch_size = valid_sample["image_rgb_input"].shape[0]
-
-                if args.verbose:
-                    print(
-                        "Processing batch index {} for validation...".format(
-                            valid_batch_idx
-                        )
-                    )
-                    print(
-                        "Sample names in this validation batch: {}".format(
-                            this_valid_batch_sample_names
-                        )
-                    )
-                    print(
-                        "This validation batch size: {}".format(this_valid_batch_size)
-                    )
-
-                # New unified validation
-                valid_network_input_heads = []
-                valid_network_input_heads.append(valid_sample["image_rgb_input"].cuda())
-
-                if (
-                    dream_network.network_config["architecture"]["target"]
-                    == "belief_maps"
-                ):
-                    valid_labels = valid_sample["belief_maps"].cuda()
-                elif (
-                    dream_network.network_config["architecture"]["target"]
-                    == "keypoints"
-                ):
-                    valid_labels = valid_sample["keypoint_projections_output"].cuda()
-                else:
-                    assert (
-                        False
-                    ), "Could not determine how to provide validation labels to network."
-
-                valid_loss = dream_network.loss(valid_network_input_heads, valid_labels)
-
-                valid_loss_this_batch = valid_loss.item()
-                valid_batch_losses.append(valid_loss_this_batch)
-                if args.verbose:
-                    print(
-                        "Validation loss for this batch: {}".format(
-                            valid_loss_this_batch
-                        )
-                    )
-                    print("")
-                valid_batch_sample_names.append(this_valid_batch_sample_names)
-
-            mean_valid_loss_per_batch = np.mean(valid_batch_losses)
-            std_valid_loss_per_batch = np.std(valid_batch_losses)
+        (
+            mean_valid_loss_per_batch,
+            std_valid_loss_per_batch,
+            valid_batch_losses,
+            valid_batch_sample_names,
+            wandb_visualization_sample,
+        ) = _run_validation(
+            args,
+            dream_network,
+            valid_data_loader,
+            log_wandb_visualizations,
+        )
 
         # Bookkeeping and print info
         dream_network.network_config["training"]["results"]["epochs_trained"] += 1
@@ -620,13 +1025,41 @@ def train_network(args):
                 )
 
         this_epoch_timestamp = time.time() - training_start_time
+        epoch_duration = this_epoch_timestamp - last_epoch_timestamp
         print(
             "This epoch took {} seconds.".format(
-                this_epoch_timestamp - last_epoch_timestamp
+                epoch_duration
             )
         )
         last_epoch_timestamp = this_epoch_timestamp
         print("")
+
+        _log_wandb_epoch(
+            wandb_run,
+            this_epoch,
+            mean_training_loss_per_batch,
+            std_training_loss_per_batch,
+            mean_valid_loss_per_batch,
+            std_valid_loss_per_batch,
+            training_batch_losses,
+            valid_batch_losses,
+            this_epoch_timestamp,
+            epoch_duration,
+            best_valid_loss,
+        )
+
+        if (
+            log_wandb_visualizations
+            and wandb_visualization_sample is not None
+            and this_epoch % args.wandb_visualize_every == 0
+        ):
+            _log_wandb_visualizations(
+                wandb_run,
+                dream_network,
+                wandb_visualization_sample,
+                this_epoch,
+                args.wandb_num_visualizations,
+            )
 
         # Append to history
         train_log["epochs"].append(this_epoch)
@@ -663,6 +1096,9 @@ def train_network(args):
         # Rename the final training log instead of re-writing it
         training_log_path = os.path.join(args.output_dir, "training_log.pkl")
         os.rename(epoch_training_log_path, training_log_path)
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
     print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
     print("")
@@ -716,6 +1152,18 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-e", "--epochs", type=int, required=True, help="Number of epochs to train."
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Train for a fixed number of optimizer steps instead of full epochs.",
+    )
+    parser.add_argument(
+        "--log-every-steps",
+        type=int,
+        default=100,
+        help="When using --max-steps, run validation, save checkpoints, and log to W&B every N optimizer steps.",
     )
     parser.add_argument(
         "-b",
@@ -776,6 +1224,54 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Resumes training. The epoch argument provided now is the new training duration. All arguments must match the previously trained networks.",
+    )
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        default=False,
+        help="Enable Weights & Biases logging. Set WANDB_API_KEY in the environment before running in online mode.",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="DREAM",
+        help="Weights & Biases project name.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Optional Weights & Biases entity/team name.",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Optional Weights & Biases run name.",
+    )
+    parser.add_argument(
+        "--wandb-tags",
+        nargs="+",
+        default=None,
+        help="Optional tags to attach to the Weights & Biases run.",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        choices=["online", "offline", "disabled"],
+        default="online",
+        help="Weights & Biases logging mode.",
+    )
+    parser.add_argument(
+        "--wandb-visualize-every",
+        type=int,
+        default=0,
+        help="Log validation image overlays to W&B every N epochs. 0 disables image logging.",
+    )
+    parser.add_argument(
+        "--wandb-num-visualizations",
+        type=int,
+        default=4,
+        help="Number of validation samples to visualize when W&B image logging is enabled.",
     )
 
     args = parser.parse_args()
